@@ -1,3 +1,4 @@
+// Package requester 提供网络请求简便操作
 package requester
 
 var (
@@ -7,3 +8,13 @@ var (
 	// DefaultClient 默认 http 客户端
 	DefaultClient = NewHTTPClient()
 )
+
+// ContentTyper Content-Type 接口
+type ContentTyper interface {
+	ContentType() string
+}
+
+// ContentLengther Content-Length 接口
+type ContentLengther interface {
+	ContentLength() int64
+}

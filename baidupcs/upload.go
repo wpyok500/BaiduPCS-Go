@@ -1,105 +1,123 @@
 package baidupcs
 
 import (
-	"encoding/json"
 	"fmt"
-	"github.com/bitly/go-simplejson"
-	"github.com/iikira/BaiduPCS-Go/requester"
+	"github.com/json-iterator/go"
+	"net/http"
 	"net/http/cookiejar"
 )
 
+// UploadFunc 上传文件处理函数
+type UploadFunc func(uploadURL string, jar *cookiejar.Jar) (resp *http.Response, err error)
+
 // RapidUpload 秒传文件
-func (p PCSApi) RapidUpload(targetPath, md5, smd5, crc32 string, length int64) (err error) {
-	p.addItem("file", "rapidupload", map[string]string{
-		"path":           targetPath,         // 上传文件的全路径名
-		"content-length": fmt.Sprint(length), // 待秒传的文件长度
-		"content-md5":    md5,                // 待秒传的文件的MD5
-		"slice-md5":      smd5,               // 待秒传的文件的MD5
-		"content-crc32":  crc32,              // 待秒传文件CRC32
-		"ondup":          "overwrite",        // overwrite: 表示覆盖同名文件; newcopy: 表示生成文件副本并进行重命名，命名规则为“文件名_日期.后缀”
-	})
-
-	h := requester.NewHTTPClient()
-	h.SetCookiejar(p.getJar())
-
-	body, err := h.Fetch("POST", p.url.String(), nil, nil)
-	if err != nil {
+func (pcs *BaiduPCS) RapidUpload(targetPath, contentMD5, sliceMD5, crc32 string, length int64) (pcsError Error) {
+	dataReadCloser, pcsError := pcs.PrepareRapidUpload(targetPath, contentMD5, sliceMD5, crc32, length)
+	if pcsError != nil {
 		return
 	}
 
-	json, err := simplejson.NewJson(body)
-	if err != nil {
-		return
+	defer dataReadCloser.Close()
+
+	errInfo := decodeJSONError(OperationUpload, dataReadCloser)
+	if errInfo == nil {
+		return nil
 	}
 
-	code, err := checkErr(json)
-
-	switch code {
+	switch errInfo.ErrorCode() {
 	case 31079:
 		// file md5 not found, you should use upload api to upload the whole file.
 	}
 
-	if err != nil {
-		return fmt.Errorf("秒传文件 遇到错误, 错误代码: %d, 消息: %s", code, err)
-	}
-
-	return nil
+	return errInfo
 }
 
 // Upload 上传单个文件
-func (p PCSApi) Upload(targetPath string, uploadFunc func(uploadURL string, jar *cookiejar.Jar) error) (err error) {
-	p.addItem("file", "upload", map[string]string{
-		"path":  targetPath,
-		"ondup": "overwrite",
-	})
+func (pcs *BaiduPCS) Upload(targetPath string, uploadFunc UploadFunc) (pcsError Error) {
+	dataReadCloser, pcsError := pcs.PrepareUpload(targetPath, uploadFunc)
+	if pcsError != nil {
+		return
+	}
 
-	return uploadFunc(p.url.String(), p.getJar())
-}
+	defer dataReadCloser.Close()
 
-// UploadTmpFile 分片上传—文件分片及上传
-func (p PCSApi) UploadTmpFile(targetPath string, uploadFunc func(uploadURL string, jar *cookiejar.Jar) error) (err error) {
-	p.addItem("file", "upload", map[string]string{
-		"path": targetPath,
-		"type": "tmpfile",
-	})
-
-	return uploadFunc(p.url.String(), p.getJar())
-}
-
-// UploadCreateSuperFile 分片上传—合并分片文件
-func (p PCSApi) UploadCreateSuperFile(targetPath string, blockList ...string) (err error) {
-	bl := struct {
-		BlockList []string `json:"block_list"`
+	// 数据处理
+	jsonData := &struct {
+		*PathJSON
+		*ErrInfo
 	}{
-		BlockList: blockList,
+		ErrInfo: NewErrorInfo(OperationUpload),
 	}
 
-	data, _ := json.Marshal(&bl)
+	d := jsoniter.NewDecoder(dataReadCloser)
 
-	p.addItem("file", "createsuperfile", map[string]string{
-		"path":  targetPath,
-		"param": string(data),
-		"ondup": "overwrite",
-	})
-
-	h := requester.NewHTTPClient()
-	h.SetCookiejar(p.getJar())
-
-	body, err := h.Fetch("POST", p.url.String(), nil, nil)
+	err := d.Decode(jsonData)
 	if err != nil {
-		return
+		jsonData.ErrInfo.jsonError(err)
+		return jsonData.ErrInfo
 	}
 
-	sjson, err := simplejson.NewJson(body)
-	if err != nil {
-		return
+	if jsonData.ErrCode != 0 {
+		return jsonData.ErrInfo
 	}
 
-	code, err := checkErr(sjson)
-
-	if err != nil {
-		return fmt.Errorf("合并分片文件 遇到错误, 错误代码: %d, 消息: %s", code, err)
+	if jsonData.Path == "" {
+		jsonData.ErrInfo.errType = ErrTypeInternalError
+		jsonData.ErrInfo.err = fmt.Errorf("unknown response data, file saved path not found")
+		return jsonData.ErrInfo
 	}
 
 	return nil
+}
+
+// UploadTmpFile 分片上传—文件分片及上传
+func (pcs *BaiduPCS) UploadTmpFile(uploadFunc UploadFunc) (md5 string, pcsError Error) {
+	dataReadCloser, pcsError := pcs.PrepareUploadTmpFile(uploadFunc)
+	if pcsError != nil {
+		return "", pcsError
+	}
+
+	defer dataReadCloser.Close()
+
+	// 数据处理
+	jsonData := &struct {
+		MD5 string `json:"md5"`
+		*ErrInfo
+	}{
+		ErrInfo: NewErrorInfo(OperationUploadTmpFile),
+	}
+
+	d := jsoniter.NewDecoder(dataReadCloser)
+
+	err := d.Decode(jsonData)
+	if err != nil {
+		jsonData.ErrInfo.jsonError(err)
+		return "", jsonData.ErrInfo
+	}
+
+	if jsonData.ErrCode != 0 {
+		return "", jsonData.ErrInfo
+	}
+
+	// 未找到md5
+	if jsonData.MD5 == "" {
+		jsonData.ErrInfo.errType = ErrTypeInternalError
+		jsonData.ErrInfo.err = fmt.Errorf("unknown response data, md5 not found, error: %s", err)
+		return "", jsonData.ErrInfo
+	}
+
+	return jsonData.MD5, nil
+}
+
+// UploadCreateSuperFile 分片上传—合并分片文件
+func (pcs *BaiduPCS) UploadCreateSuperFile(targetPath string, blockList ...string) (pcsError Error) {
+	dataReadCloser, pcsError := pcs.PrepareUploadCreateSuperFile(targetPath, blockList...)
+	if pcsError != nil {
+		return pcsError
+	}
+
+	defer dataReadCloser.Close()
+
+	errInfo := decodeJSONError(OperationUploadCreateSuperFile, dataReadCloser)
+	return errInfo
 }

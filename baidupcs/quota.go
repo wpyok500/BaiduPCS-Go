@@ -1,35 +1,41 @@
 package baidupcs
 
 import (
-	"fmt"
-	"github.com/bitly/go-simplejson"
-	"github.com/iikira/BaiduPCS-Go/requester"
+	"github.com/json-iterator/go"
 )
 
+type quotaInfo struct {
+	*ErrInfo
+
+	Quota int64 `json:"quota"`
+	Used  int64 `json:"used"`
+}
+
 // QuotaInfo 获取当前用户空间配额信息
-func (p PCSApi) QuotaInfo() (quota, used int64, err error) {
-	p.addItem("quota", "info")
-
-	h := requester.NewHTTPClient()
-	body, err := h.Fetch("GET", p.url.String(), nil, map[string]string{
-		"Cookie": "BDUSS=" + p.bduss,
-	})
-	if err != nil {
+func (pcs *BaiduPCS) QuotaInfo() (quota, used int64, pcsError Error) {
+	dataReadCloser, pcsError := pcs.PrepareQuotaInfo()
+	if pcsError != nil {
 		return
 	}
 
-	json, err := simplejson.NewJson(body)
-	if err != nil {
-		return
+	defer dataReadCloser.Close()
+
+	quotaInfo := &quotaInfo{
+		ErrInfo: NewErrorInfo(OperationQuotaInfo),
 	}
 
-	code, err := checkErr(json)
+	d := jsoniter.NewDecoder(dataReadCloser)
+	err := d.Decode(quotaInfo)
 	if err != nil {
-		return 0, 0, fmt.Errorf("获取当前用户空间配额信息, 错误代码: %d, 消息: %s", code, err)
+		quotaInfo.ErrInfo.jsonError(err)
+		return 0, 0, quotaInfo.ErrInfo
 	}
 
-	quota = json.Get("quota").MustInt64()
-	used = json.Get("used").MustInt64()
+	if quotaInfo.ErrCode != 0 {
+		return 0, 0, quotaInfo.ErrInfo
+	}
 
+	quota = quotaInfo.Quota
+	used = quotaInfo.Used
 	return
 }
